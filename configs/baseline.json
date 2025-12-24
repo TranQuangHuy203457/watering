@@ -1,0 +1,6 @@
+{
+  "name": "baseline",
+  "description": "Default network send interval and instrumentation enabled",
+  "NETWORK_MIN_INTERVAL_MS": 30000,
+  "NETWORK_MAX_RETRIES": 3
+}

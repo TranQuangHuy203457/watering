@@ -1,0 +1,6 @@
+{
+  "name": "improved",
+  "description": "Increase network interval to reduce overload; used for improved KPI experiments",
+  "NETWORK_MIN_INTERVAL_MS": 60000,
+  "NETWORK_MAX_RETRIES": 2
+}
