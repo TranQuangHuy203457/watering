@@ -4,8 +4,11 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
-// JSON parsing for weather API
 #include <ArduinoJson.h>
+#include "SPIFFS.h"
+#include <cstdarg>
+#include "web_server.h"
+#include "state.h"
 
 // Pin map
 static constexpr uint8_t PIN_SDA = 21;
@@ -70,9 +73,17 @@ volatile float forecast3Temp = 0;
 volatile float forecast3Hum = 0;
 volatile float forecast3Light = 0;
 volatile bool pumpOn = false;
-volatile bool valveOn[3] = {false, false, false};
 volatile bool rainSoon = false;
 volatile uint64_t nextIrrigationMs = 0;
+
+// share system mode with other translation units
+#include "system_mode.h"
+volatile SystemMode systemMode = MODE_NORMAL;
+
+// Irrigation runtime state (moved up so DisplayTask can reference it)
+struct IrrState { bool active; uint32_t startMs; int plant; };
+static IrrState irr = {false, 0, 0};
+
 
 // Optional feedback pins: set to -1 if not wired. When provided, ErrorCheckTask will
 // toggle the relay briefly and read the feedback pin to confirm operation.
@@ -84,8 +95,9 @@ static constexpr int PIN_FEEDBACK_LED = -1;
 
 // Device health state (assume OK until proven otherwise)
 volatile bool pumpOk = true;
-volatile bool valveOk[3] = {true, true, true};
 volatile bool ledOk = true;
+// pump expiry for manual control (managed via state API)
+volatile uint32_t pumpExpiryMs = 0;
 
 // Config
 static constexpr float SOIL_ON = 60.0f;
@@ -123,7 +135,88 @@ static void logTask(const char *name, uint32_t start, uint32_t duration, uint32_
 // Forward decl
 void applyOutputs();
 void stopIrrigation();
-void startIrrigation(int plant);
+void startIrrigation(int plant, uint32_t durationMs = IRRIG_MS);
+static void reportTaskStart();
+
+// State mutex for safe snapshotting from web server
+static SemaphoreHandle_t stateMutex = nullptr;
+
+void initStateLock()
+{
+  if (stateMutex == nullptr)
+  {
+    stateMutex = xSemaphoreCreateMutex();
+  }
+}
+
+void populateStatus(JsonDocument &doc)
+{
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  doc["airTemp"] = airTemp;
+  doc["airHum"] = airHum;
+  JsonArray s = doc.createNestedArray("soil");
+  s.add(soilPct[0]); s.add(soilPct[1]); s.add(soilPct[2]);
+  doc["pumpOn"] = pumpOn ? 1 : 0;
+  doc["forecastTemp"] = forecastTemp;
+  doc["forecastHum"] = forecastHum;
+  doc["forecast3Temp"] = forecast3Temp;
+  doc["forecast3Hum"] = forecast3Hum;
+  doc["forecastLight"] = forecastLight;
+  doc["rainSoon"] = rainSoon ? 1 : 0;
+  doc["nextIrrigationMs"] = (uint32_t)(nextIrrigationMs / 1000);
+  doc["mode"] = (int)systemMode;
+  if (stateMutex) xSemaphoreGive(stateMutex);
+}
+
+void setPumpWithExpiry(bool on, uint32_t expiryMs)
+{
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  pumpOn = on;
+  pumpExpiryMs = expiryMs;
+  if (stateMutex) xSemaphoreGive(stateMutex);
+}
+
+void checkAndExpireState()
+{
+  uint32_t now = (uint32_t)millis();
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  if (pumpExpiryMs != 0 && now >= pumpExpiryMs)
+  {
+    pumpOn = false;
+    pumpExpiryMs = 0;
+  }
+  if (stateMutex) xSemaphoreGive(stateMutex);
+}
+
+void getStateSnapshot(StateSnapshot &s)
+{
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  for (int i = 0; i < 3; ++i) s.soil[i] = soilPct[i];
+  s.airTemp = airTemp;
+  s.airHum = airHum;
+  s.forecastTemp = forecastTemp;
+  s.forecastHum = forecastHum;
+  s.forecast3Temp = forecast3Temp;
+  s.forecast3Hum = forecast3Hum;
+  s.forecastLight = forecastLight;
+  s.rainSoon = rainSoon;
+  s.pumpOn = pumpOn;
+  s.pumpOk = pumpOk;
+  s.ledOk = ledOk;
+  s.nextIrrigationMs = nextIrrigationMs;
+  s.mode = systemMode;
+  s.irrActive = irr.active;
+  s.irrPlant = irr.plant;
+  s.irrStartMs = irr.startMs;
+  if (stateMutex) xSemaphoreGive(stateMutex);
+}
+
+void setNextIrrigationMs(uint64_t v)
+{
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  nextIrrigationMs = v;
+  if (stateMutex) xSemaphoreGive(stateMutex);
+}
 
 // Utils
 float mapSoilToPct(int raw)
@@ -166,7 +259,12 @@ void SoilTask(void *)
   for (;;)
   {
     uint32_t t0 = millis();
-    for (int i = 0; i < 3; ++i) soilPct[i] = readSoilPct(pins[i]);
+    reportTaskStart();
+    float tmp[3];
+    for (int i = 0; i < 3; ++i) tmp[i] = readSoilPct(pins[i]);
+    if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+    for (int i = 0; i < 3; ++i) soilPct[i] = tmp[i];
+    if (stateMutex) xSemaphoreGive(stateMutex);
     uint32_t t1 = millis();
     logTask("SoilTask", t0, t1 - t0, DL_SOIL_MS);
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -178,12 +276,15 @@ void DHTTask(void *)
   for (;;)
   {
     uint32_t t0 = millis();
+    reportTaskStart();
     float h = dht.readHumidity();
     float t = dht.readTemperature();
     if (!isnan(h) && !isnan(t))
     {
+      if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
       airHum = h;
       airTemp = t;
+      if (stateMutex) xSemaphoreGive(stateMutex);
     }
     else
     {
@@ -212,36 +313,48 @@ void ErrorCheckTask(void *)
     return (v == LOW) || (v == HIGH); // if we can read something, consider it OK (conservative)
   };
 
+  // track consecutive failures to escalate to SAFE
+  static int consecutiveFailures = 0;
+
   for (;;)
   {
     uint32_t t0 = millis();
+    reportTaskStart();
+    bool anyFail = false;
+
     // Check pump
     if (PIN_FEEDBACK_PUMP >= 0)
     {
       pumpOk = checkOutput(PIN_RELAY_PUMP, PIN_FEEDBACK_PUMP);
       Serial.printf("[ErrorCheck] pumpOk=%d\n", pumpOk ? 1 : 0);
-    }
-    // Check valves
-    if (PIN_FEEDBACK_V1 >= 0)
-    {
-      valveOk[0] = checkOutput(PIN_RELAY_V1, PIN_FEEDBACK_V1);
-      Serial.printf("[ErrorCheck] valve1Ok=%d\n", valveOk[0] ? 1 : 0);
-    }
-    if (PIN_FEEDBACK_V2 >= 0)
-    {
-      valveOk[1] = checkOutput(PIN_RELAY_V2, PIN_FEEDBACK_V2);
-      Serial.printf("[ErrorCheck] valve2Ok=%d\n", valveOk[1] ? 1 : 0);
-    }
-    if (PIN_FEEDBACK_V3 >= 0)
-    {
-      valveOk[2] = checkOutput(PIN_RELAY_V3, PIN_FEEDBACK_V3);
-      Serial.printf("[ErrorCheck] valve3Ok=%d\n", valveOk[2] ? 1 : 0);
+      if (!pumpOk) anyFail = true;
     }
     // LED check (optional)
     if (PIN_FEEDBACK_LED >= 0)
     {
       ledOk = checkOutput(PIN_LED_WD, PIN_FEEDBACK_LED);
       Serial.printf("[ErrorCheck] ledOk=%d\n", ledOk ? 1 : 0);
+      if (!ledOk) anyFail = true;
+    }
+
+    // Decide system mode based on failures
+    if (anyFail)
+    {
+      consecutiveFailures++;
+      // escalate: first failures -> DEGRADED, repeated failures -> SAFE
+      if (consecutiveFailures >= 3)
+      {
+        setSystemMode(MODE_SAFE);
+      }
+      else
+      {
+        setSystemMode(MODE_DEGRADED);
+      }
+    }
+    else
+    {
+      consecutiveFailures = 0;
+      setSystemMode(MODE_NORMAL);
     }
 
     uint32_t t1 = millis();
@@ -256,6 +369,7 @@ void WeatherTask(void *)
   for (;;)
   {
     uint32_t t0 = millis();
+    reportTaskStart();
     if (strlen(WEATHER_API_KEY_STR) == 0)
     {
       // No API key provided at compile time; skip real calls.
@@ -295,30 +409,46 @@ void WeatherTask(void *)
             JsonObject v = arr[0]["values"];
             if (!v.isNull())
             {
-              if (v.containsKey("temperature")) forecastTemp = v["temperature"].as<float>();
-              if (v.containsKey("humidity")) forecastHum = v["humidity"].as<float>();
-              // choose light proxy: visibility else uvIndex
-              if (v.containsKey("visibility")) forecastLight = v["visibility"].as<float>();
-              else if (v.containsKey("uvIndex")) forecastLight = v["uvIndex"].as<float>();
-              // decide rainSoon based on precipitationProbability or rainIntensity
+              // compute new values locally to avoid partial updates
+              float newForecastTemp = forecastTemp;
+              float newForecastHum = forecastHum;
+              float newForecastLight = forecastLight;
               bool willRain = false;
+              if (v.containsKey("temperature")) newForecastTemp = v["temperature"].as<float>();
+              if (v.containsKey("humidity")) newForecastHum = v["humidity"].as<float>();
+              if (v.containsKey("visibility")) newForecastLight = v["visibility"].as<float>();
+              else if (v.containsKey("uvIndex")) newForecastLight = v["uvIndex"].as<float>();
               if (v.containsKey("precipitationProbability") && v["precipitationProbability"].as<int>() > 20) willRain = true;
               if (v.containsKey("rainIntensity") && v["rainIntensity"].as<float>() > 0.1f) willRain = true;
               if (v.containsKey("rainAccumulation") && v["rainAccumulation"].as<float>() > 0.0f) willRain = true;
-              rainSoon = willRain;
-              // also capture 3-hour ahead (if available as next element)
+
+              float newForecast3Temp = forecast3Temp;
+              float newForecast3Hum = forecast3Hum;
+              float newForecast3Light = forecast3Light;
               if (arr.size() > 1)
               {
                 JsonObject v3 = arr[1]["values"];
                 if (!v3.isNull())
                 {
-                  if (v3.containsKey("temperature")) forecast3Temp = v3["temperature"].as<float>();
-                  if (v3.containsKey("humidity")) forecast3Hum = v3["humidity"].as<float>();
-                  if (v3.containsKey("visibility")) forecast3Light = v3["visibility"].as<float>();
-                  else if (v3.containsKey("uvIndex")) forecast3Light = v3["uvIndex"].as<float>();
+                  if (v3.containsKey("temperature")) newForecast3Temp = v3["temperature"].as<float>();
+                  if (v3.containsKey("humidity")) newForecast3Hum = v3["humidity"].as<float>();
+                  if (v3.containsKey("visibility")) newForecast3Light = v3["visibility"].as<float>();
+                  else if (v3.containsKey("uvIndex")) newForecast3Light = v3["uvIndex"].as<float>();
                 }
               }
-              Serial.printf("[WeatherTask] forecastT=%.1f H=%.0f light=%.2f -> +3h T=%.1f H=%.0f L=%.2f rain=%d\n", forecastTemp, forecastHum, forecastLight, forecast3Temp, forecast3Hum, forecast3Light, rainSoon ? 1 : 0);
+
+              // commit atomically
+              if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+              forecastTemp = newForecastTemp;
+              forecastHum = newForecastHum;
+              forecastLight = newForecastLight;
+              rainSoon = willRain;
+              forecast3Temp = newForecast3Temp;
+              forecast3Hum = newForecast3Hum;
+              forecast3Light = newForecast3Light;
+              if (stateMutex) xSemaphoreGive(stateMutex);
+
+              Serial.printf("[WeatherTask] forecastT=%.1f H=%.0f light=%.2f -> +3h T=%.1f H=%.0f L=%.2f rain=%d\n", newForecastTemp, newForecastHum, newForecastLight, newForecast3Temp, newForecast3Hum, newForecast3Light, willRain ? 1 : 0);
             }
           }
         }
@@ -350,6 +480,7 @@ void NetworkTask(void *)
   for (;;)
   {
     uint32_t t0 = millis();
+    reportTaskStart();
     if (WiFi.status() == WL_CONNECTED)
     {
       // Admission control: ensure we don't send more often than allowed
@@ -362,18 +493,13 @@ void NetworkTask(void *)
       }
       else
       {
-        String payload = "{";
-        payload += "\"airTemp\":" + String(airTemp, 1) + ",";
-        payload += "\"airHum\":" + String(airHum, 1) + ",";
-        payload += "\"forecastTemp\":" + String(forecastTemp, 1) + ",";
-        payload += "\"forecastHum\":" + String(forecastHum, 1) + ",";
-        payload += "\"forecastLight\":" + String(forecastLight, 1) + ",";
-        payload += "\"pumpOn\":" + String(pumpOn ? 1 : 0) + ",";
-        payload += "\"rainSoon\":" + String(rainSoon ? 1 : 0) + ",";
-        payload += "\"nextIrrigationMs\":" + String((uint32_t)nextIrrigationMs) + ",";
-        payload += "\"soil\":[" + String(soilPct[0], 1) + "," + String(soilPct[1], 1) + "," + String(soilPct[2], 1) + "],";
-        payload += "\"valves\":[" + String(valveOn[0] ? 1 : 0) + "," + String(valveOn[1] ? 1 : 0) + "," + String(valveOn[2] ? 1 : 0) + "]";
-        payload += "}";
+           // Build payload from an atomic snapshot to avoid tearing
+           StaticJsonDocument<512> doc;
+           populateStatus(doc);
+           // include valves placeholder
+           doc.createNestedArray("valves");
+           String payload;
+           serializeJson(doc, payload);
 
         // Only send telemetry to Supabase. If not configured, skip sending.
         int code = 0;
@@ -419,30 +545,48 @@ void DisplayTask(void *)
   for (;;)
   {
     uint32_t t0 = millis();
-    // Show: current air temp/hum, 3h forecast (temp/hum/light), pump/LED, and valve states
+    reportTaskStart();
+    // Obtain atomic snapshot for display
+    StaticJsonDocument<512> st;
+    populateStatus(st);
     bool ledState = digitalRead(PIN_LED_WD) == HIGH;
+    float dispAirT = st["airTemp"]; 
+    float dispAirH = st["airHum"];
+    float dispF3T = st["forecast3Temp"]; 
+    float dispF3H = st["forecast3Hum"];
+    float dispFL = st["forecastLight"];
+    bool dispPump = st["pumpOn"]; 
+    uint32_t dispNext = (uint32_t)st["nextIrrigationMs"];
+    JsonArray sarr = st["soil"].as<JsonArray>();
+    float s0 = sarr.size() > 0 ? sarr[0].as<float>() : 0;
+    float s1 = sarr.size() > 1 ? sarr[1].as<float>() : 0;
+    float s2 = sarr.size() > 2 ? sarr[2].as<float>() : 0;
+
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("T:"); lcd.print(airTemp, 1); lcd.print("C H:"); lcd.print(airHum, 0); lcd.print("%   ");
+    lcd.print("T:"); lcd.print(dispAirT, 1); lcd.print("C H:"); lcd.print(dispAirH, 0); lcd.print("%   ");
     lcd.setCursor(0, 1);
-    lcd.print("+3h T:"); lcd.print(forecast3Temp, 1); lcd.print("C H:"); lcd.print((int)forecast3Hum); lcd.print("%   ");
+    lcd.print("+3h T:"); lcd.print(dispF3T, 1); lcd.print("C H:"); lcd.print((int)dispF3H); lcd.print("%   ");
     lcd.setCursor(0, 2);
-    lcd.print("L:"); lcd.print((int)forecastLight); lcd.print(" fL:"); lcd.print((int)forecast3Light); lcd.print("   ");
+    lcd.print("L:"); lcd.print((int)dispFL); lcd.print("   ");
     lcd.setCursor(0, 3);
-    lcd.print("Pump:"); lcd.print(pumpOn ? "ON" : "OFF"); lcd.print(" ");
+    lcd.print("Pump:"); lcd.print(dispPump ? "ON" : "OFF"); lcd.print(" ");
     lcd.print("LED:"); lcd.print(ledState ? "ON" : "OFF");
-    // Small delay to let user read; also show valve states on next refresh
     vTaskDelay(pdMS_TO_TICKS(2000));
-    // show valves and soil
+
+    // show soil and active irrigation zone (use snapshot for soil and irr)
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("S1:"); lcd.print(soilPct[0], 0); lcd.print("% V1:"); lcd.print(valveOn[0] ? "ON" : "OFF");
+    lcd.print("S1:"); lcd.print(s0, 0); lcd.print("% ");
+    lcd.setCursor(10, 0);
+    // irrigation info read directly (small window) - use snapshot fields
+    lcd.print("Zone:"); lcd.print(st["mode"].as<int>() == 0 ? (st["mode"].as<int>() , -1) : -1);
     lcd.setCursor(0, 1);
-    lcd.print("S2:"); lcd.print(soilPct[1], 0); lcd.print("% V2:"); lcd.print(valveOn[1] ? "ON" : "OFF");
+    lcd.print("S2:"); lcd.print(s1, 0); lcd.print("% ");
     lcd.setCursor(0, 2);
-    lcd.print("S3:"); lcd.print(soilPct[2], 0); lcd.print("% V3:"); lcd.print(valveOn[2] ? "ON" : "OFF");
+    lcd.print("S3:"); lcd.print(s2, 0); lcd.print("% ");
     lcd.setCursor(0, 3);
-    lcd.print("Next:"); lcd.print((uint32_t)(nextIrrigationMs / 1000)); lcd.print("s");
+    lcd.print("Next:"); lcd.print((uint32_t)dispNext); lcd.print("s");
     uint32_t t1 = millis();
     logTask("DisplayTask", t0, t1 - t0, DL_DISPLAY_MS);
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -454,6 +598,7 @@ void WatchdogTask(void *)
   for (;;)
   {
     uint32_t t0 = millis();
+    reportTaskStart();
     digitalWrite(PIN_LED_WD, !digitalRead(PIN_LED_WD));
     uint32_t t1 = millis();
     logTask("WatchdogTask", t0, t1 - t0, DL_WATCHDOG_MS);
@@ -461,40 +606,224 @@ void WatchdogTask(void *)
   }
 }
 
-struct IrrState { bool active; uint32_t startMs; int plant; };
-static IrrState irr = {false, 0, 0};
+// --- EDF scheduler support -------------------------------------------------
+struct TaskInfo
+{
+  const char *name;
+  TaskHandle_t handle;
+  uint32_t periodMs; // relative deadline / period
+  uint32_t lastStartMs; // last time the task began work
+};
+
+// Forward-declared task handles (filled in at creation)
+static TaskHandle_t hSoil = nullptr;
+static TaskHandle_t hDHT = nullptr;
+static TaskHandle_t hSwitch = nullptr;
+static TaskHandle_t hError = nullptr;
+static TaskHandle_t hWeather = nullptr;
+static TaskHandle_t hNetwork = nullptr;
+static TaskHandle_t hDisplay = nullptr;
+static TaskHandle_t hWatchdog = nullptr;
+
+// Small fixed array of managed tasks
+static TaskInfo managedTasks[8];
+static const int managedTaskCount = 8;
+
+// Called by tasks to report they started a new activation
+static void reportTaskStart()
+{
+  TaskHandle_t self = xTaskGetCurrentTaskHandle();
+  uint32_t now = millis();
+  for (int i = 0; i < managedTaskCount; ++i)
+  {
+    if (managedTasks[i].handle == self)
+    {
+      managedTasks[i].lastStartMs = now;
+      if (managedTasks[i].name)
+      {
+        Serial.printf("[EDF] task start: %s t=%u\\n", managedTasks[i].name, (unsigned)now);
+      }
+      break;
+    }
+  }
+}
+
+// Append formatted log to SPIFFS file
+static void fileLog(const char *fmt, ...)
+{
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  // Mirror to Serial for immediate debugging
+  Serial.print("[LOGFILE] ");
+  Serial.println(buf);
+
+
+  // Rotate if too large
+  const size_t MAX_LOG = 64 * 1024;
+  if (SPIFFS.exists("/edf_log.txt"))
+  {
+    File ff = SPIFFS.open("/edf_log.txt", FILE_READ);
+    if (ff)
+    {
+      size_t sz = ff.size();
+      ff.close();
+      if (sz > MAX_LOG)
+      {
+        SPIFFS.remove("/edf_log.bak");
+        SPIFFS.rename("/edf_log.txt", "/edf_log.bak");
+      }
+    }
+  }
+
+  File f = SPIFFS.open("/edf_log.txt", FILE_APPEND);
+  if (!f)
+  {
+    Serial.println("[LOGFILE] open failed");
+    return;
+  }
+  f.println(buf);
+  f.close();
+}
+
+// Implement setSystemMode (declared in system_mode.h)
+void setSystemMode(SystemMode m)
+{
+  if (systemMode == m) return;
+  systemMode = m;
+  if (m == MODE_SAFE)
+  {
+    nextIrrigationMs = millis() + SCHEDULE_MS; // push schedule
+    fileLog("[SYS] entered SAFE mode, deferred irrigation");
+  }
+  else if (m == MODE_DEGRADED)
+  {
+    // when degraded, be conservative: delay next irrigation by 1 hour
+    nextIrrigationMs = millis() + (60UL * 60UL * 1000UL);
+    fileLog("[SYS] entered DEGRADED mode, delaying irrigation 1h");
+  }
+  else
+  {
+    fileLog("[SYS] back to NORMAL mode");
+  }
+}
+
+// EDF scheduler task: periodically recomputes absolute deadlines and assigns
+// dynamic FreeRTOS priorities so the task with the earliest deadline runs.
+void EDFSchedulerTask(void *)
+{
+  (void)pvTaskGetThreadLocalStoragePointer(NULL, 0);
+  for (;;)
+  {
+    uint32_t now = millis();
+    // Simple selection-sort style ranking by absolute deadline
+    // Create local copy of indices
+    int idx[managedTaskCount];
+    for (int i = 0; i < managedTaskCount; ++i) idx[i] = i;
+    for (int i = 0; i < managedTaskCount - 1; ++i)
+    {
+      int best = i;
+      uint32_t bestDeadline = managedTasks[idx[best]].lastStartMs + managedTasks[idx[best]].periodMs;
+      for (int j = i + 1; j < managedTaskCount; ++j)
+      {
+        uint32_t d = managedTasks[idx[j]].lastStartMs + managedTasks[idx[j]].periodMs;
+        if (d < bestDeadline)
+        {
+          best = j;
+          bestDeadline = d;
+        }
+      }
+      if (best != i) { int t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
+    }
+
+    // Assign dynamic priorities: earlier deadline -> higher numeric priority
+    // Keep priorities within a small range to avoid colliding with system tasks
+    const UBaseType_t maxPrio = configMAX_PRIORITIES > 6 ? 6 : (configMAX_PRIORITIES - 1);
+    for (int rank = 0; rank < managedTaskCount; ++rank)
+    {
+      int i = idx[rank];
+      if (managedTasks[i].handle == nullptr) continue;
+      // highest priority for rank 0
+      UBaseType_t prio = (UBaseType_t)(maxPrio - rank);
+      if (prio < 1) prio = 1;
+      vTaskPrioritySet(managedTasks[i].handle, prio);
+    }
+
+    // Log EDF ordering and remaining times until deadline
+    Serial.print("[EDF] schedule: ");
+    for (int rank = 0; rank < managedTaskCount; ++rank)
+    {
+      int i = idx[rank];
+      if (managedTasks[i].handle == nullptr) continue;
+      uint32_t absDeadline = managedTasks[i].lastStartMs + managedTasks[i].periodMs;
+      int32_t timeLeft = (int32_t)(absDeadline - now);
+      Serial.printf("%s(rl=%ld) ", managedTasks[i].name ? managedTasks[i].name : "?", (long)timeLeft);
+      // append to file buffer
+      (void)0;
+    }
+    Serial.println();
+
+    // Build single line and append to file
+    char lbuf[256];
+    size_t pos = 0;
+    for (int rank = 0; rank < managedTaskCount; ++rank)
+    {
+      int i = idx[rank];
+      if (managedTasks[i].handle == nullptr) continue;
+      uint32_t absDeadline = managedTasks[i].lastStartMs + managedTasks[i].periodMs;
+      int32_t timeLeft = (int32_t)(absDeadline - now);
+      int n = snprintf(lbuf + pos, sizeof(lbuf) - pos, "%s(rl=%ld) ", managedTasks[i].name ? managedTasks[i].name : "?", (long)timeLeft);
+      if (n > 0) pos += (size_t)n;
+      if (pos >= sizeof(lbuf) - 32) break;
+    }
+    if (pos == 0) strcpy(lbuf, "(empty)");
+    fileLog("[EDF] schedule: %s", lbuf);
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+static uint32_t irrDurationMs = IRRIG_MS;
 
 void applyOutputs()
 {
   // Only drive outputs if the device passed the last health check
-  if (pumpOk)
-    digitalWrite(PIN_RELAY_PUMP, pumpOn ? HIGH : LOW);
+  bool pOn;
+  bool pOk;
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
+  pOn = pumpOn;
+  pOk = pumpOk;
+  if (stateMutex) xSemaphoreGive(stateMutex);
+
+  if (pOk)
+    digitalWrite(PIN_RELAY_PUMP, pOn ? HIGH : LOW);
   else
     digitalWrite(PIN_RELAY_PUMP, LOW);
-
-  if (valveOk[0]) digitalWrite(PIN_RELAY_V1, valveOn[0] ? HIGH : LOW);
-  else digitalWrite(PIN_RELAY_V1, LOW);
-
-  if (valveOk[1]) digitalWrite(PIN_RELAY_V2, valveOn[1] ? HIGH : LOW);
-  else digitalWrite(PIN_RELAY_V2, LOW);
-
-  if (valveOk[2]) digitalWrite(PIN_RELAY_V3, valveOn[2] ? HIGH : LOW);
-  else digitalWrite(PIN_RELAY_V3, LOW);
+  // Valves removed: ensure valve outputs are off
+  digitalWrite(PIN_RELAY_V1, LOW);
+  digitalWrite(PIN_RELAY_V2, LOW);
+  digitalWrite(PIN_RELAY_V3, LOW);
 }
 
 void stopIrrigation()
 {
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
   pumpOn = false;
-  valveOn[0] = valveOn[1] = valveOn[2] = false;
   irr.active = false;
+  if (stateMutex) xSemaphoreGive(stateMutex);
   applyOutputs();
 }
 
-void startIrrigation(int plant)
+void startIrrigation(int plant, uint32_t durationMs)
 {
+  if (stateMutex) xSemaphoreTake(stateMutex, portMAX_DELAY);
   irr = {true, static_cast<uint32_t>(millis()), plant};
+  irrDurationMs = durationMs;
   pumpOn = true;
-  valveOn[plant] = true;
+  if (stateMutex) xSemaphoreGive(stateMutex);
   applyOutputs();
 }
 
@@ -516,44 +845,70 @@ void SwitchTask(void *)
   for (;;)
   {
     uint32_t now = millis();
-    if (nextIrrigationMs == 0) nextIrrigationMs = now + SCHEDULE_MS;
-    bool scheduleDue = now >= nextIrrigationMs;
+    reportTaskStart();
 
-    if (irr.active)
+    StateSnapshot s;
+    getStateSnapshot(s);
+    if (s.nextIrrigationMs == 0) setNextIrrigationMs(now + SCHEDULE_MS);
+    bool scheduleDue = now >= s.nextIrrigationMs;
+
+    // If system is in SAFE mode, be conservative: skip any new irrigation cycles
+    if (s.mode == MODE_SAFE)
     {
-      bool timeDone = (now - irr.startMs) >= IRRIG_MS;
-      bool soilDone = soilPct[irr.plant] >= SOIL_OFF;
+      if (!s.irrActive)
+      {
+        // defer schedule and skip
+        setNextIrrigationMs(now + SCHEDULE_MS);
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
+    if (s.irrActive)
+    {
+      bool timeDone = (now - s.irrStartMs) >= irrDurationMs;
+      bool soilDone = s.soil[s.irrPlant] >= SOIL_OFF;
       if (timeDone || soilDone) stopIrrigation();
     }
     else
     {
-      // Use forecast and current conditions to compute desired soil threshold
-      const float desiredThreshold = computeSoilOnThreshold();
+      // Use forecast and current conditions from snapshot to compute desired soil threshold
+      const float desiredThreshold = [&s]()->float {
+        float thr = SOIL_ON;
+        if (s.airTemp > 30.0f && s.airHum < 40.0f) thr += 8.0f;
+        if (s.forecast3Temp > 32.0f && s.forecast3Hum < 40.0f) thr += 5.0f;
+        if (s.forecastHum > 80.0f) thr -= 6.0f;
+        if (thr < 40.0f) thr = 40.0f;
+        if (thr > 95.0f) thr = 95.0f;
+        return thr;
+      }();
+
       // Skip if rainSoon or forecast predicts high humidity
-      if (scheduleDue && !rainSoon && forecastHum < 90.0f)
+      if (scheduleDue && !s.rainSoon && s.forecastHum < 90.0f)
       {
         bool started = false;
         for (int i = 0; i < 3; ++i)
         {
           // only start if device health is OK
-          if (!pumpOk)
+          if (!s.pumpOk)
           {
             Serial.println("[SwitchTask] pump not OK, skipping irrigation");
             break;
           }
-          if (!valveOk[i])
+          if (s.soil[i] < desiredThreshold)
           {
-            Serial.printf("[SwitchTask] valve %d not OK, skipping this zone\n", i);
-            continue;
-          }
-          if (soilPct[i] < desiredThreshold)
-          {
-            startIrrigation(i);
+            uint32_t dur = IRRIG_MS;
+            if (s.mode == MODE_DEGRADED)
+            {
+              dur = 5UL * 60UL * 1000UL; // 5 minutes
+              Serial.printf("[SwitchTask] DEGRADED: using short irrigation %lu ms\n", (unsigned long)dur);
+            }
+            startIrrigation(i, dur);
             started = true;
             break;
           }
         }
-        if (!started) nextIrrigationMs = now + SCHEDULE_MS; // nothing to water, push schedule
+        if (!started) setNextIrrigationMs(now + SCHEDULE_MS); // nothing to water, push schedule
       }
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -580,6 +935,16 @@ void setup()
   lcd.init();
   lcd.backlight();
 
+  // Mount SPIFFS for file logging
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("[setup] SPIFFS mount failed");
+  }
+  else
+  {
+    Serial.println("[setup] SPIFFS mounted");
+  }
+
   pinMode(PIN_RELAY_PUMP, OUTPUT);
   pinMode(PIN_RELAY_V1, OUTPUT);
   pinMode(PIN_RELAY_V2, OUTPUT);
@@ -590,15 +955,32 @@ void setup()
   analogReadResolution(12);
   dht.begin();
   wifiConnect();
+  // start web UI
+  // initialize state mutex before web server handlers use state API
+  initStateLock();
+  initWebServer();
 
-  xTaskCreatePinnedToCore(SoilTask, "Soil", 4096, nullptr, 2, nullptr, 1);
-  xTaskCreatePinnedToCore(DHTTask, "DHT", 4096, nullptr, 2, nullptr, 1);
-  xTaskCreatePinnedToCore(SwitchTask, "Switch", 4096, nullptr, 3, nullptr, 1);
-  xTaskCreatePinnedToCore(ErrorCheckTask, "Err", 2048, nullptr, 2, nullptr, 0);
-  xTaskCreatePinnedToCore(WeatherTask, "Weather", 4096, nullptr, 1, nullptr, 0);
-  xTaskCreatePinnedToCore(NetworkTask, "Net", 4096, nullptr, 1, nullptr, 0);
-  xTaskCreatePinnedToCore(DisplayTask, "LCD", 4096, nullptr, 1, nullptr, 0);
-  xTaskCreatePinnedToCore(WatchdogTask, "WD", 2048, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(SoilTask, "Soil", 4096, nullptr, 2, &hSoil, 1);
+  xTaskCreatePinnedToCore(DHTTask, "DHT", 4096, nullptr, 2, &hDHT, 1);
+  xTaskCreatePinnedToCore(SwitchTask, "Switch", 4096, nullptr, 3, &hSwitch, 1);
+  xTaskCreatePinnedToCore(ErrorCheckTask, "Err", 2048, nullptr, 2, &hError, 0);
+  xTaskCreatePinnedToCore(WeatherTask, "Weather", 4096, nullptr, 1, &hWeather, 0);
+  xTaskCreatePinnedToCore(NetworkTask, "Net", 4096, nullptr, 1, &hNetwork, 0);
+  xTaskCreatePinnedToCore(DisplayTask, "LCD", 4096, nullptr, 1, &hDisplay, 0);
+  xTaskCreatePinnedToCore(WatchdogTask, "WD", 2048, nullptr, 3, &hWatchdog, 0);
+
+  // Populate managedTasks for EDF scheduler
+  managedTasks[0] = {"Soil", hSoil, DL_SOIL_MS, millis()};
+  managedTasks[1] = {"DHT", hDHT, DL_DHT_MS, millis()};
+  managedTasks[2] = {"Switch", hSwitch, DL_SWITCH_MS, millis()};
+  managedTasks[3] = {"ErrorCheck", hError, DL_ERROR_MS, millis()};
+  managedTasks[4] = {"Weather", hWeather, DL_WEATHER_MS, millis()};
+  managedTasks[5] = {"Network", hNetwork, DL_NETWORK_MS, millis()};
+  managedTasks[6] = {"Display", hDisplay, DL_DISPLAY_MS, millis()};
+  managedTasks[7] = {"Watchdog", hWatchdog, DL_WATCHDOG_MS, millis()};
+
+  // Start EDF scheduler task
+  xTaskCreatePinnedToCore(EDFSchedulerTask, "EDF", 4096, nullptr, 4, nullptr, 0);
 }
 
 void loop()

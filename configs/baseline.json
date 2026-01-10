@@ -1,6 +1,72 @@
 {
   "name": "baseline",
-  "description": "Default network send interval and instrumentation enabled",
-  "NETWORK_MIN_INTERVAL_MS": 30000,
-  "NETWORK_MAX_RETRIES": 3
+  "description": "Baseline configuration - Static priority scheduling, no database logging",
+  "scheduling": {
+    "policy": "static_priority",
+    "algorithm": "rate_monotonic",
+    "tasks": {
+      "Switch": {
+        "period_ms": 500,
+        "wcet_ms": 5,
+        "deadline_ms": 450,
+        "priority": 5,
+        "firmness": "hard"
+      },
+      "Sensor": {
+        "period_ms": 1000,
+        "wcet_ms": 8,
+        "deadline_ms": 900,
+        "priority": 4,
+        "firmness": "hard"
+      },
+      "Weather": {
+        "period_ms": 60000,
+        "wcet_ms": 200,
+        "deadline_ms": 10000,
+        "priority": 3,
+        "firmness": "soft"
+      },
+      "Network": {
+        "period_ms": 2000,
+        "wcet_ms": 10,
+        "deadline_ms": 1800,
+        "priority": 3,
+        "firmness": "soft"
+      },
+      "Display": {
+        "period_ms": 5000,
+        "wcet_ms": 12,
+        "deadline_ms": 4500,
+        "priority": 2,
+        "firmness": "soft"
+      }
+    }
+  },
+  "synchronization": {
+    "mutex_type": "priority_inheritance",
+    "critical_section_max_us": 100
+  },
+  "communication": {
+    "mode": "standard",
+    "queue_size": 100,
+    "priority_queue": false,
+    "dscp_marking": false,
+    "timeout_ms": 200,
+    "retry_count": 3
+  },
+  "database": {
+    "mode": "disabled",
+    "filesystem": "none",
+    "logging": false
+  },
+  "utilization": {
+    "calculated": 0.0287,
+    "percentage": "2.87%",
+    "schedulable": true,
+    "bound": 0.743
+  },
+  "firmware": {
+    "NETWORK_MIN_INTERVAL_MS": 30000,
+    "NETWORK_MAX_RETRIES": 3
+  }
 }

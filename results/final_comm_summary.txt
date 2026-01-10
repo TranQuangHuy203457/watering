@@ -1,0 +1,5 @@
+REAL-TIME COMMUNICATION FINAL REPORT
+======================================================================
+
+--- BADCASE ---
+Total: 30 | Success: 0 (0.0%) | Loss: 30 (100.0%)

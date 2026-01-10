@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RTOS Watering - Dashboard</title>
+  <link rel="stylesheet" href="/style.css?v=2">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>RTOS Watering Dashboard</h1>
+      <div class="top-info">
+        <div class="card"><strong>Air</strong><div id="air">--</div></div>
+        <div class="card"><strong>Forecast +3h</strong><div id="f3">--</div></div>
+        <div class="card"><strong>Mode</strong><div id="mode">--</div></div>
+        <div class="card"><strong>Pump</strong><div id="pump">--</div></div>
+        <div class="card"><strong>Light</strong><div id="light">--</div></div>
+      </div>
+    </header>
+
+    <main>
+      <section class="charts">
+        <div class="chart-card">
+          <h3>Temperature (°C)</h3>
+          <canvas id="tempChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <h3>Humidity (%)</h3>
+          <canvas id="humChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <h3>Soil Moisture (%)</h3>
+          <canvas id="soilChart"></canvas>
+        </div>
+      </section>
+
+      <aside class="controls card">
+        <h2>Controls</h2>
+        
+        <div style="margin-bottom:20px;padding:10px;background:#f3f4f6;border-radius:6px">
+          <h3 style="margin:0 0 10px 0;font-size:1em;color:#374151">Control Mode</h3>
+          <div class="control-row">
+            <label style="margin-right:15px"><input type="radio" name="ctrlMode" value="auto" checked> Auto</label>
+            <label><input type="radio" name="ctrlMode" value="manual"> Manual</label>
+          </div>
+        </div>
+        
+        <div style="margin-bottom:15px">
+          <h3 style="margin:0 0 10px 0;font-size:1em;color:#374151">Pump Control</h3>
+          <div class="control-row">
+            <label><input id="pumpChk" type="checkbox"> Enable Pump</label>
+          </div>
+          <div class="control-row" style="margin-top:8px">
+            <span style="color:#6b7280;font-size:0.9em">Duration (s):</span>
+            <input id="pumpDur" type="number" min="0" value="10" style="width:80px;margin-left:8px">
+          </div>
+        </div>
+        
+        <div style="margin-bottom:15px">
+          <h3 style="margin:0 0 10px 0;font-size:1em;color:#374151">Light Control</h3>
+          <div class="control-row">
+            <label><input id="lightChk" type="checkbox"> Enable Light</label>
+          </div>
+          <div class="control-row" style="margin-top:8px">
+            <span style="color:#6b7280;font-size:0.9em">Duration (s):</span>
+            <input id="lightDur" type="number" min="0" value="10" style="width:80px;margin-left:8px">
+          </div>
+        </div>
+        
+        <div class="control-row"><button id="applyBtn" style="width:100%;padding:10px;font-size:1em">Apply Changes</button></div>
+        
+        <div id="statusMsg" style="margin-top:10px;padding:8px;border-radius:4px;font-size:0.9em;display:none"></div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/app.js?v=2"></script>
+</body>
+</html>

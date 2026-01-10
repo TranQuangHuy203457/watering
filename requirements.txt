@@ -1,0 +1,19 @@
+# requirements.txt
+# Python dependencies for RTOS Watering System simulations and analysis
+
+# No external dependencies required for current simulations
+# All scripts use Python standard library only:
+# - time
+# - random
+# - statistics
+# - csv
+# - json
+# - socket
+# - threading
+# - http.server
+# - collections
+
+# Optional: for future enhancements
+# matplotlib>=3.5.0  # For plotting graphs
+# numpy>=1.21.0      # For advanced numerical analysis
+# pandas>=1.3.0      # For data manipulation
