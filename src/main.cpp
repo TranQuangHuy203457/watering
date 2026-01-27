@@ -85,8 +85,7 @@ struct IrrState { bool active; uint32_t startMs; int plant; };
 static IrrState irr = {false, 0, 0};
 
 
-// Optional feedback pins: set to -1 if not wired. When provided, ErrorCheckTask will
-// toggle the relay briefly and read the feedback pin to confirm operation.
+// Optional feedback pins: set to -1 if not wired.
 static constexpr int PIN_FEEDBACK_PUMP = -1;
 static constexpr int PIN_FEEDBACK_V1 = -1;
 static constexpr int PIN_FEEDBACK_V2 = -1;
@@ -111,17 +110,18 @@ static constexpr int ADC_DRY = 2400;  // value when soil dry
 
 // Instrumentation / scheduling measurement
 #define MEASURE_DEADLINES 1
-static constexpr uint32_t DL_SOIL_MS = 1000;
+static constexpr uint32_t DL_SOIL_MS = 500;
 static constexpr uint32_t DL_DHT_MS = 2000;
-static constexpr uint32_t DL_SWITCH_MS = 1000;
+static constexpr uint32_t DL_SWITCH_MS = 500;
 static constexpr uint32_t DL_ERROR_MS = 5000;
-static constexpr uint32_t DL_WEATHER_MS = 3600000;
-static constexpr uint32_t DL_NETWORK_MS = 30000;
+static constexpr uint32_t DL_WEATHER_MS = 60000;
+static constexpr uint32_t DL_NETWORK_MS = 2000;
 static constexpr uint32_t DL_DISPLAY_MS = 1000;
-static constexpr uint32_t DL_WATCHDOG_MS = 2000;
+static constexpr uint32_t DL_WATCHDOG_MS = 5000;
+static constexpr uint32_t DL_LOG_MS = 5000;
 
 // Network throttling / admission control
-static constexpr uint32_t NETWORK_MIN_SEND_INTERVAL_MS = 30000; // min time between sends
+static constexpr uint32_t NETWORK_MIN_SEND_INTERVAL_MS = 1000; // min time between sends (1s period)
 static constexpr int NETWORK_MAX_RETRIES = 3;
 
 static void logTask(const char *name, uint32_t start, uint32_t duration, uint32_t deadline)
@@ -267,7 +267,8 @@ void SoilTask(void *)
     if (stateMutex) xSemaphoreGive(stateMutex);
     uint32_t t1 = millis();
     logTask("SoilTask", t0, t1 - t0, DL_SOIL_MS);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // 500ms period per task model
+    vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
 
@@ -296,70 +297,6 @@ void DHTTask(void *)
     uint32_t t1 = millis();
     logTask("DHTTask", t0, t1 - t0, DL_DHT_MS);
     vTaskDelay(pdMS_TO_TICKS(2000));
-  }
-}
-
-void ErrorCheckTask(void *)
-{
-  auto checkOutput = [](int relayPin, int feedbackPin)->bool {
-    if (feedbackPin < 0) return true; // no feedback available, assume OK
-    pinMode(feedbackPin, INPUT_PULLUP);
-    // Pulse the relay briefly and read feedback
-    digitalWrite(relayPin, HIGH);
-    delay(120);
-    int v = digitalRead(feedbackPin);
-    digitalWrite(relayPin, LOW);
-    // feedback active-low or active-high is unknown; treat LOW as active if pull-up used
-    return (v == LOW) || (v == HIGH); // if we can read something, consider it OK (conservative)
-  };
-
-  // track consecutive failures to escalate to SAFE
-  static int consecutiveFailures = 0;
-
-  for (;;)
-  {
-    uint32_t t0 = millis();
-    reportTaskStart();
-    bool anyFail = false;
-
-    // Check pump
-    if (PIN_FEEDBACK_PUMP >= 0)
-    {
-      pumpOk = checkOutput(PIN_RELAY_PUMP, PIN_FEEDBACK_PUMP);
-      Serial.printf("[ErrorCheck] pumpOk=%d\n", pumpOk ? 1 : 0);
-      if (!pumpOk) anyFail = true;
-    }
-    // LED check (optional)
-    if (PIN_FEEDBACK_LED >= 0)
-    {
-      ledOk = checkOutput(PIN_LED_WD, PIN_FEEDBACK_LED);
-      Serial.printf("[ErrorCheck] ledOk=%d\n", ledOk ? 1 : 0);
-      if (!ledOk) anyFail = true;
-    }
-
-    // Decide system mode based on failures
-    if (anyFail)
-    {
-      consecutiveFailures++;
-      // escalate: first failures -> DEGRADED, repeated failures -> SAFE
-      if (consecutiveFailures >= 3)
-      {
-        setSystemMode(MODE_SAFE);
-      }
-      else
-      {
-        setSystemMode(MODE_DEGRADED);
-      }
-    }
-    else
-    {
-      consecutiveFailures = 0;
-      setSystemMode(MODE_NORMAL);
-    }
-
-    uint32_t t1 = millis();
-    logTask("ErrorCheckTask", t0, t1 - t0, DL_ERROR_MS);
-    vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
 
@@ -468,7 +405,8 @@ void WeatherTask(void *)
 
     uint32_t t1 = millis();
     logTask("WeatherTask", t0, t1 - t0, DL_WEATHER_MS);
-    vTaskDelay(pdMS_TO_TICKS(3600 * 1000));
+    // 60s period per task model
+    vTaskDelay(pdMS_TO_TICKS(60000));
   }
 }
 
@@ -536,7 +474,8 @@ void NetworkTask(void *)
         logTask("NetworkTask-send", t0, t1 - t0, DL_NETWORK_MS);
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(30000));
+    // 1s period per task model (deadline 2s)
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
@@ -572,7 +511,8 @@ void DisplayTask(void *)
     lcd.setCursor(0, 3);
     lcd.print("Pump:"); lcd.print(dispPump ? "ON" : "OFF"); lcd.print(" ");
     lcd.print("LED:"); lcd.print(ledState ? "ON" : "OFF");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    // Show first page ~0.5s
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     // show soil and active irrigation zone (use snapshot for soil and irr)
     lcd.clear();
@@ -589,20 +529,23 @@ void DisplayTask(void *)
     lcd.print("Next:"); lcd.print((uint32_t)dispNext); lcd.print("s");
     uint32_t t1 = millis();
     logTask("DisplayTask", t0, t1 - t0, DL_DISPLAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // Show second page ~0.5s -> overall ~1s period
+    vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
 
-void WatchdogTask(void *)
+// Background async logging task (soft RT, very low priority)
+void LogTask(void *)
 {
   for (;;)
   {
     uint32_t t0 = millis();
     reportTaskStart();
-    digitalWrite(PIN_LED_WD, !digitalRead(PIN_LED_WD));
+    // Simulate asynchronous log flush (~20ms worst case)
+    delay(20);
     uint32_t t1 = millis();
-    logTask("WatchdogTask", t0, t1 - t0, DL_WATCHDOG_MS);
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    logTask("LogTask", t0, t1 - t0, DL_LOG_MS);
+    vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
 
@@ -619,15 +562,14 @@ struct TaskInfo
 static TaskHandle_t hSoil = nullptr;
 static TaskHandle_t hDHT = nullptr;
 static TaskHandle_t hSwitch = nullptr;
-static TaskHandle_t hError = nullptr;
 static TaskHandle_t hWeather = nullptr;
 static TaskHandle_t hNetwork = nullptr;
 static TaskHandle_t hDisplay = nullptr;
-static TaskHandle_t hWatchdog = nullptr;
+static TaskHandle_t hLog = nullptr;
 
-// Small fixed array of managed tasks
-static TaskInfo managedTasks[8];
-static const int managedTaskCount = 8;
+// Small fixed array of managed tasks: exactly the 7 application tasks in the model
+static TaskInfo managedTasks[7];
+static const int managedTaskCount = 7;
 
 // Called by tasks to report they started a new activation
 static void reportTaskStart()
@@ -960,24 +902,24 @@ void setup()
   initStateLock();
   initWebServer();
 
-  xTaskCreatePinnedToCore(SoilTask, "Soil", 4096, nullptr, 2, &hSoil, 1);
-  xTaskCreatePinnedToCore(DHTTask, "DHT", 4096, nullptr, 2, &hDHT, 1);
-  xTaskCreatePinnedToCore(SwitchTask, "Switch", 4096, nullptr, 3, &hSwitch, 1);
-  xTaskCreatePinnedToCore(ErrorCheckTask, "Err", 2048, nullptr, 2, &hError, 0);
+  xTaskCreatePinnedToCore(SoilTask, "Soil", 4096, nullptr, 4, &hSoil, 1);
+  xTaskCreatePinnedToCore(DHTTask, "DHT", 4096, nullptr, 3, &hDHT, 1);
+  xTaskCreatePinnedToCore(SwitchTask, "Switch", 4096, nullptr, 5, &hSwitch, 1);
   xTaskCreatePinnedToCore(WeatherTask, "Weather", 4096, nullptr, 1, &hWeather, 0);
-  xTaskCreatePinnedToCore(NetworkTask, "Net", 4096, nullptr, 1, &hNetwork, 0);
-  xTaskCreatePinnedToCore(DisplayTask, "LCD", 4096, nullptr, 1, &hDisplay, 0);
-  xTaskCreatePinnedToCore(WatchdogTask, "WD", 2048, nullptr, 3, &hWatchdog, 0);
+  xTaskCreatePinnedToCore(NetworkTask, "Net", 4096, nullptr, 2, &hNetwork, 0);
+  xTaskCreatePinnedToCore(DisplayTask, "LCD", 4096, nullptr, 2, &hDisplay, 0);
+  // Background async logging task (very low priority)
+  xTaskCreatePinnedToCore(LogTask, "Log", 4096, nullptr, 1, &hLog, 0);
 
   // Populate managedTasks for EDF scheduler
-  managedTasks[0] = {"Soil", hSoil, DL_SOIL_MS, millis()};
-  managedTasks[1] = {"DHT", hDHT, DL_DHT_MS, millis()};
-  managedTasks[2] = {"Switch", hSwitch, DL_SWITCH_MS, millis()};
-  managedTasks[3] = {"ErrorCheck", hError, DL_ERROR_MS, millis()};
-  managedTasks[4] = {"Weather", hWeather, DL_WEATHER_MS, millis()};
-  managedTasks[5] = {"Network", hNetwork, DL_NETWORK_MS, millis()};
-  managedTasks[6] = {"Display", hDisplay, DL_DISPLAY_MS, millis()};
-  managedTasks[7] = {"Watchdog", hWatchdog, DL_WATCHDOG_MS, millis()};
+  // Exactly the 7 application tasks from the task model
+  managedTasks[0] = {"SwitchTask", hSwitch, DL_SWITCH_MS, millis()};
+  managedTasks[1] = {"SoilTask",   hSoil,   DL_SOIL_MS,   millis()};
+  managedTasks[2] = {"DHTTask",    hDHT,    DL_DHT_MS,    millis()};
+  managedTasks[3] = {"NetworkTask",hNetwork,DL_NETWORK_MS,millis()};
+  managedTasks[4] = {"DisplayTask",hDisplay,DL_DISPLAY_MS,millis()};
+  managedTasks[5] = {"WeatherTask",hWeather,DL_WEATHER_MS,millis()};
+  managedTasks[6] = {"LogTask",    hLog,    DL_LOG_MS,    millis()};
 
   // Start EDF scheduler task
   xTaskCreatePinnedToCore(EDFSchedulerTask, "EDF", 4096, nullptr, 4, nullptr, 0);

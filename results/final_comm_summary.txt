@@ -2,4 +2,41 @@ REAL-TIME COMMUNICATION FINAL REPORT
 ======================================================================
 
 --- BADCASE ---
-Total: 30 | Success: 0 (0.0%) | Loss: 30 (100.0%)
+Total: 200 | Success: 158 (79.0%) | Loss: 42 (21.0%)
+T1→TX_START: p50=0.002 p95=0.004 p99=0.004 max=0.006 mean=0.002
+TX_DURATION: p50=0.181 p95=0.205 p99=0.224 max=0.256 mean=0.159
+E2E_T1→SRV: p50=50.748 p95=51.051 p99=51.157 max=51.174 mean=50.749
+RTT: p50=51.040 p95=51.339 p99=51.435 max=51.493 mean=51.006
+
+--- BASELINE ---
+Total: 200 | Success: 200 (100.0%) | Loss: 0 (0.0%)
+T1→TX_START: p50=0.003 p95=0.005 p99=0.007 max=0.020 mean=0.003
+TX_DURATION: p50=0.178 p95=0.233 p99=0.262 max=0.416 mean=0.156
+E2E_T1→SRV: p50=0.292 p95=0.343 p99=0.363 max=0.384 mean=0.251
+RTT: p50=0.514 p95=0.604 p99=0.622 max=0.654 mean=0.442
+
+
+======================================================================
+INTERPRETATION
+======================================================================
+
+Timestamping points:
+  T1: Message creation (producer)
+  T2: Queue insertion (enqueue)
+  T3: Socket send start (tx_start)
+  T4: Socket send complete (tx_end)
+  T5: Server receive (srv_recv)
+  T6: Client ACK receive (ack_recv)
+
+End-to-end latency components:
+  - Queueing delay: T2 - T1 (negligible in simulation)
+  - Processing delay: T3 - T2 (measured as T1→TX_START)
+  - I/O wait: T4 - T3 (TX_DURATION)
+  - Network propagation: T5 - T4 (included in E2E)
+  - Server processing: included in RTT
+  - Return propagation: T6 - T5 (included in RTT)
+
+Bad-case behavior:
+  - Packet loss: shown in Timeout/Loss percentage
+  - Increased latency: shown in p95/p99 metrics
+  - Jitter: difference between p50 and p99

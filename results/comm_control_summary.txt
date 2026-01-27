@@ -1,3 +1,0 @@
-rows=50 samples=50 missing_ack=50
-latency_ms: p50=0.001 p95=0.004 p99=0.006 max=0.006 mean=0.001
-exec_ms: p50=0.104 p95=0.203 p99=0.217 max=0.221 mean=0.120
